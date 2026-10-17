@@ -1,9 +1,89 @@
 'use strict';
 const D = window.MUZ_DATA;
 const $ = id => document.getElementById(id);
-const number = (value, digits = 0) => Number(value).toLocaleString('ru-RU', { maximumFractionDigits: digits });
+const locales = { ru: 'ru-RU', ky: 'ky-KG', en: 'en-GB' };
+let language = 'ru';
+try { const saved = localStorage.getItem('muzbank-language'); if (locales[saved]) language = saved; } catch (_) {}
+const number = (value, digits = 0) => Number(value).toLocaleString(locales[language], { maximumFractionDigits: digits });
+function t(source, params = {}) {
+  const text = language === 'ru' ? source : (window.MUZ_TRANSLATIONS[source]?.[language] ?? source);
+  return text.replace(/\{(\w+)\}/g, (match, key) => Object.hasOwn(params, key) ? String(params[key]) : match);
+}
+const siteName = site => t(site.id === 'custom' ? 'Выбранная точка' : site.name);
+let staticText = [], staticAttributes = [];
+
+function captureStaticText() {
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (node.parentElement.closest('script, style')) continue;
+    const source = node.textContent.trim();
+    if (window.MUZ_TRANSLATIONS[source]) staticText.push({ node, source, original: node.textContent });
+  }
+  document.querySelectorAll('[aria-label], [placeholder]').forEach(node => {
+    for (const attr of ['aria-label', 'placeholder']) {
+      const source = node.getAttribute(attr);
+      if (source && window.MUZ_TRANSLATIONS[source]) staticAttributes.push({ node, attr, source });
+    }
+  });
+}
+
+function renderSource() {
+  const climate = { snapshot: 'Климат: встроенный снимок Open-Meteo', archive: 'Архив Open-Meteo загружен', missing: 'Климат не получен' };
+  const elevation = { snapshot: 'высота: встроенный снимок', api: 'высота: Copernicus DEM, API', missing: 'высоту введите вручную' };
+  $('data-source').textContent = `${t(climate[state.source.weather])} · ${t(elevation[state.source.elevation])}. ${t('Сезон 2024–2025.')}`;
+  $('api-status').textContent = t(state.apiMessage || '');
+}
+
+function setApiMessage(source, error = false) {
+  state.apiMessage = source;
+  $('api-status').textContent = t(source);
+  $('api-status').classList.toggle('error', error);
+}
+
+function renderLanguage() {
+  document.documentElement.lang = language;
+  for (const { node, source, original } of staticText) node.textContent = original.replace(source, t(source));
+  for (const { node, attr, source } of staticAttributes) node.setAttribute(attr, t(source));
+  document.querySelectorAll('[data-language]').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.dataset.language === language));
+  });
+  const crop = $('crop').value || D.crops[0].id;
+  const comparison = $('compare-site').value || 'naryn';
+  $('crop').innerHTML = D.crops.map(c => `<option value="${c.id}">${t(c.name)}</option>`).join('');
+  $('crop').value = crop;
+  $('compare-site').innerHTML = D.sites.map(site => `<option value="${site.id}">${siteName(site)}</option>`).join('');
+  $('compare-site').value = comparison;
+  $('site-buttons').innerHTML = D.sites.map(site => `<button class="site-button${state.site?.id === site.id ? ' active' : ''}" data-site="${site.id}">${siteName(site)} ↗</button>`).join('');
+  $('score-rules').innerHTML = D.rules.map(rule => `<div><b>${t(rule.name)} / ${rule.max} ${t('баллов')}</b><p>${t(rule.explanation)}</p></div>`).join('');
+  $('season-label').textContent = t('Ноябрь 2024 — июль 2025 · сглаженный профиль');
+  $('model-description').textContent = t('Рост: h = k × √FDD, k = {k} м/√(°C·день). FDD — накопленные отрицательные градусо-дни ноября–февраля. Приращение толщины добавляется к остатку льда. Таяние: Δh = {melt} × max(T, 0) м/день, не больше имеющегося льда. Объём = площадь × h. Плотность льда относительно воды = {density}. Все коэффициенты — допущения из data.js, требуют калибровки.', { k: number(D.model.k, 3), melt: number(D.model.meltFactor, 3), density: number(D.model.iceDensity, 1) });
+  $('compare-toggle').textContent = t(state.comparing ? 'Убрать сравнение' : 'Сравнить два участка');
+  if (!state.map && !window.L) $('map').innerHTML = `<p class="map-fallback">${t('Карта не загрузилась. Выберите подготовленную точку кнопками выше. Расчёты доступны.')}</p>`;
+  (state.siteMarkers || []).forEach(({ layer, site }) => layer.setTooltipContent(siteName(site)));
+  if (state.map?.zoomControl) {
+    const container = state.map.zoomControl.getContainer();
+    [['.leaflet-control-zoom-in', 'Увеличить масштаб'], ['.leaflet-control-zoom-out', 'Уменьшить масштаб']].forEach(([selector, label]) => {
+      const button = container.querySelector(selector);
+      if (button) { button.title = t(label); button.setAttribute('aria-label', t(label)); }
+    });
+  }
+  if (state.site) {
+    $('site-name').textContent = siteName(state.site);
+    renderSource();
+    updateAll();
+  }
+}
+
+function setLanguage(next) {
+  if (!locales[next]) return;
+  language = next;
+  try { localStorage.setItem('muzbank-language', language); } catch (_) {}
+  renderLanguage();
+}
+
 const state = { site: null, map: null, marker: null, request: 0, controller: null, comparing: false, series: [], pilot: false, source: '' };
-const monthNames = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
+const monthName = month => new Intl.DateTimeFormat(locales[language], { month: 'short', timeZone: 'UTC' }).format(new Date(Date.UTC(2025, month, 1)));
 
 function value(id) {
   const el = $(id);
@@ -17,18 +97,20 @@ function winterMean(months) {
 // 1. Карта и оценка участка.
 function initMap() {
   if (!window.L) {
-    $('map').innerHTML = '<p class="map-fallback">Карта не загрузилась. Выберите подготовленную точку кнопками выше. Расчёты доступны.</p>';
+    $('map').innerHTML = `<p class="map-fallback">${t('Карта не загрузилась. Выберите подготовленную точку кнопками выше. Расчёты доступны.')}</p>`;
     return;
   }
   state.map = L.map('map', { scrollWheelZoom: false }).setView([41.4287, 75.9911], 9);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 18, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
   }).addTo(state.map);
+  state.siteMarkers = [];
   D.sites.forEach(site => {
-    L.circleMarker([site.lat, site.lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#21634d', fillOpacity: 1 })
-      .addTo(state.map).bindTooltip(site.name).on('click', event => {
+    const layer = L.circleMarker([site.lat, site.lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#21634d', fillOpacity: 1 })
+      .addTo(state.map).bindTooltip(siteName(site)).on('click', event => {
         L.DomEvent.stopPropagation(event); selectSite(site.id);
       });
+    state.siteMarkers.push({ layer, site });
   });
   state.map.on('click', event => {
     state.pilot = false;
@@ -43,16 +125,16 @@ function selectSite(selection, keepPilot = false) {
   if (!keepPilot) state.pilot = false;
   const site = typeof selection === 'string' ? D.sites.find(s => s.id === selection) : selection;
   state.site = { ...site, months: site.months?.slice() || null };
-  state.source = site.months ? 'Встроенный снимок Open-Meteo · 2024–2025. Высота: Copernicus DEM GLO-90.' : 'Данные не получены. Высоту можно ввести вручную; для симуляции нужен архив температур.';
-  $('site-name').textContent = site.name;
+  state.source = { weather: site.months ? 'snapshot' : 'missing', elevation: site.elevation === null ? 'missing' : 'snapshot' };
+  $('site-name').textContent = siteName(site);
   $('coordinates').textContent = `${site.lat.toFixed(4)}° N, ${site.lon.toFixed(4)}° E`;
   $('elevation').value = site.elevation ?? '';
   $('temperature').value = site.months ? winterMean(site.months).toFixed(1) : '';
   $('slope').value = '';
   $('distance').value = '';
-  $('api-status').textContent = '';
+  setApiMessage('');
   $('refresh').disabled = false;
-  $('data-source').textContent = state.source;
+  renderSource();
   document.querySelectorAll('.site-button').forEach(b => b.classList.toggle('active', b.dataset.site === site.id));
   if (state.map) {
     if (state.marker) state.marker.remove();
@@ -72,7 +154,7 @@ async function fetchSiteData() {
   const manualAtStart = { elevation: $('elevation').value, temperature: $('temperature').value };
   $('refresh').disabled = true;
   $('api-status').className = 'small';
-  $('api-status').textContent = 'Загружаем высоту и архив сезона…';
+  setApiMessage('Загружаем высоту и архив сезона…');
   const coords = `latitude=${lat}&longitude=${lon}`;
   const urls = [
     `https://api.open-meteo.com/v1/elevation?${coords}`,
@@ -110,16 +192,14 @@ async function fetchSiteData() {
         weatherOK = true;
       }
     }
-    const hadFallback = state.site.id !== 'custom';
-    state.source = `${weatherOK ? 'Архив Open-Meteo загружен' : hadFallback ? 'Климат: встроенный снимок Open-Meteo' : 'Климат не получен'} · ${elevationOK ? 'высота: Copernicus DEM, API' : hadFallback ? 'высота: встроенный снимок' : 'высоту введите вручную'}. Сезон 2024–2025.`;
-    $('data-source').textContent = state.source;
-    $('api-status').textContent = elevationOK && weatherOK ? 'Данные обновлены. Реанализ — не измерения на участке.' : 'API ответил частично или недоступен. Сохранены доступные данные; проверьте источник выше.';
-    if (!weatherOK || !elevationOK) $('api-status').classList.add('error');
+    if (weatherOK) state.source.weather = 'archive';
+    if (elevationOK) state.source.elevation = 'api';
+    setApiMessage(elevationOK && weatherOK ? 'Данные обновлены. Реанализ — не измерения на участке.' : 'API ответил частично или недоступен. Сохранены доступные данные; проверьте источник выше.', !weatherOK || !elevationOK);
+    renderSource();
     updateAll();
   } catch (error) {
     if (request === state.request) {
-      $('api-status').textContent = 'Не удалось загрузить API. Доступные данные сохранены; недостающие параметры требуют ввода.';
-      $('api-status').classList.add('error');
+      setApiMessage('Не удалось загрузить API. Доступные данные сохранены; недостающие параметры требуют ввода.', true);
     }
   } finally {
     clearTimeout(timeout);
@@ -142,7 +222,7 @@ function calculateSuitability(inputs) {
 
 function renderSuitability(result) {
   const label = !result.complete ? 'Заполните все параметры' : result.score >= 75 ? 'Перспективно для обследования' : result.score >= 50 ? 'Есть ограничения' : 'Низкая предварительная оценка';
-  $('suitability').innerHTML = `<div class="score-header"><div class="score-number">${result.complete ? result.score : '—'}<small> / 100</small></div><div><h3>${label}</h3><p>Эвристика · не вероятность успеха</p></div></div>` + result.rows.map(r => `<div class="score-row"><span>${r.name}: ${r.value === null ? 'нет данных' : number(r.value, 1) + ' ' + r.unit}</span><div class="bar"><span style="width:${(r.score || 0) / r.max * 100}%"></span></div><b>${r.score ?? '—'}/${r.max}</b></div>`).join('');
+  $('suitability').innerHTML = `<div class="score-header"><div class="score-number">${result.complete ? result.score : '—'}<small> / 100</small></div><div><h3>${t(label)}</h3><p>${t('Эвристика · не вероятность успеха')}</p></div></div>` + result.rows.map(r => `<div class="score-row"><span>${t(r.name)}: ${r.value === null ? t('нет данных') : number(r.value, 1) + ' ' + t(r.unit)}</span><div class="bar"><span style="width:${(r.score || 0) / r.max * 100}%"></span></div><b>${r.score ?? '—'}/${r.max}</b></div>`).join('');
 }
 
 // 2. Сезонная модель: Стефан + линейное degree-day таяние.
@@ -185,7 +265,7 @@ function simulateIce(site, area, offset = 0) {
 
 function renderIceChart(series, other = []) {
   if (!series.length) {
-    $('chart').innerHTML = '<p class="small">Для симуляции нужны архив температур, зимняя температура и корректная площадь ледника.</p>';
+    $('chart').innerHTML = `<p class="small">${t('Для симуляции нужны архив температур, зимняя температура и корректная площадь ледника.')}</p>`;
     $('chart-legend').textContent = '';
     return;
   }
@@ -201,10 +281,10 @@ function renderIceChart(series, other = []) {
     grid += `<line x1="${left}" x2="${width - right}" y1="${y(v)}" y2="${y(v)}" stroke="#e5eade"/><text x="${left - 8}" y="${y(v) + 3}" text-anchor="end">${number(v)}</text>`;
   }
   series.forEach((d,i) => {
-    if (d.date.endsWith('-01')) grid += `<text x="${x(i)}" y="${height - 8}" text-anchor="middle">${monthNames[Number(d.date.slice(5,7)) - 1]}</text>`;
+    if (d.date.endsWith('-01')) grid += `<text x="${x(i)}" y="${height - 8}" text-anchor="middle">${monthName(Number(d.date.slice(5,7)) - 1)}</text>`;
   });
-  $('chart').innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Ежедневный расчёт объёма льда с ноября по июль"><title>Объём льда: ${state.site.name}${other.length ? ', сравнение с ' + $('compare-site').selectedOptions[0].textContent : ''}</title><defs><linearGradient id="ice-gradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7fb7a4" stop-opacity=".35"/><stop offset="1" stop-color="#7fb7a4" stop-opacity=".02"/></linearGradient></defs>${grid}<polygon points="${left},${y(0)} ${points(series)} ${x(series.length-1)},${y(0)}" fill="url(#ice-gradient)"/><polyline points="${points(series)}" fill="none" stroke="#286c54" stroke-width="2.5"/>${other.length ? `<polyline points="${points(other)}" fill="none" stroke="#cc9b35" stroke-width="2.5" stroke-dasharray="6 4"/>` : ''}<line x1="${x(day)}" x2="${x(day)}" y1="${top}" y2="${height - bottom}" stroke="#7a9a8c" stroke-dasharray="3 4"/><circle cx="${x(day)}" cy="${y(series[day].volume)}" r="4" fill="#286c54" stroke="white" stroke-width="2"/></svg>`;
-  $('chart-legend').innerHTML = `<span><i class="legend-dot" style="background:#286c54"></i>${state.site.name}</span>${other.length ? `<span><i class="legend-dot" style="background:#cc9b35"></i>${$('compare-site').selectedOptions[0].textContent}</span>` : ''}`;
+  $('chart').innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${t('Ежедневный расчёт объёма льда с ноября по июль')}"><title>${t('Объём льда')}: ${siteName(state.site)}${other.length ? ', ' + t('сравнение с') + ' ' + $('compare-site').selectedOptions[0].textContent : ''}</title><defs><linearGradient id="ice-gradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7fb7a4" stop-opacity=".35"/><stop offset="1" stop-color="#7fb7a4" stop-opacity=".02"/></linearGradient></defs>${grid}<polygon points="${left},${y(0)} ${points(series)} ${x(series.length-1)},${y(0)}" fill="url(#ice-gradient)"/><polyline points="${points(series)}" fill="none" stroke="#286c54" stroke-width="2.5"/>${other.length ? `<polyline points="${points(other)}" fill="none" stroke="#cc9b35" stroke-width="2.5" stroke-dasharray="6 4"/>` : ''}<line x1="${x(day)}" x2="${x(day)}" y1="${top}" y2="${height - bottom}" stroke="#7a9a8c" stroke-dasharray="3 4"/><circle cx="${x(day)}" cy="${y(series[day].volume)}" r="4" fill="#286c54" stroke="white" stroke-width="2"/></svg>`;
+  $('chart-legend').innerHTML = `<span><i class="legend-dot" style="background:#286c54"></i>${siteName(state.site)}</span>${other.length ? `<span><i class="legend-dot" style="background:#cc9b35"></i>${$('compare-site').selectedOptions[0].textContent}</span>` : ''}`;
 }
 
 function setSimulationDay() {
@@ -212,17 +292,17 @@ function setSimulationDay() {
   const current = state.series[index];
   if (!current) {
     $('ice-volume').textContent = '—'; $('ice-thickness').textContent = '—';
-    $('ice-block').style.height = '1px'; $('day-label').textContent = 'Нет данных';
-    $('ice-phase').textContent = 'ТРЕБУЮТСЯ ДАННЫЕ';
+    $('ice-block').style.height = '1px'; $('day-label').textContent = t('Нет данных');
+    $('ice-phase').textContent = t('ТРЕБУЮТСЯ ДАННЫЕ');
     renderIceChart([]);
     return;
   }
-  $('day-label').textContent = new Date(current.date + 'T00:00:00Z').toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', timeZone: 'UTC' });
+  $('day-label').textContent = new Date(current.date + 'T00:00:00Z').toLocaleDateString(locales[language], { day: 'numeric', month: 'long', timeZone: 'UTC' });
   $('ice-volume').textContent = number(current.volume);
   $('ice-thickness').textContent = number(current.thickness, 2);
   const max = Math.max(...state.series.map(d => d.thickness), 0.01);
   $('ice-block').style.height = `${Math.max(1, current.thickness / max * 150)}px`;
-  $('ice-phase').textContent = current.temperature <= 0 ? 'ХОЛОДНЫЙ ПЕРИОД' : current.thickness > 0 ? 'ЛЁД СТАНОВИТСЯ ВОДОЙ' : 'ЛЕДЯНОЙ ЗАПАС ИСЧЕРПАН';
+  $('ice-phase').textContent = t(current.temperature <= 0 ? 'ХОЛОДНЫЙ ПЕРИОД' : current.thickness > 0 ? 'ЛЁД СТАНОВИТСЯ ВОДОЙ' : 'ЛЕДЯНОЙ ЗАПАС ИСЧЕРПАН');
   renderIceChart(state.series, state.otherSeries);
 }
 
@@ -233,7 +313,7 @@ function compareSites() {
   }
   $('comparison-controls').hidden = !state.comparing;
   $('compare-toggle').setAttribute('aria-pressed', String(state.comparing));
-  $('compare-toggle').textContent = state.comparing ? 'Убрать сравнение' : 'Сравнить два участка';
+  $('compare-toggle').textContent = t(state.comparing ? 'Убрать сравнение' : 'Сравнить два участка');
   updateAll();
 }
 
@@ -263,15 +343,21 @@ function calculateWaterRange(inputs, series) {
 
 function renderWaterResults(result, inputs) {
   if (!result) {
-    $('water-results').innerHTML = '<h3>Проверьте параметры</h3><p>Введите положительные площадь, толщину и норму полива. Потери должны быть от 0 до 100%, минимум не выше максимума.</p>';
+    $('water-results').innerHTML = `<h3>${t('Проверьте параметры')}</h3><p>${t('Введите положительные площадь, толщину и норму полива. Потери должны быть от 0 до 100%, минимум не выше максимума.')}</p>`;
     $('thickness-check').textContent = '';
     return;
   }
   const r = result;
-  $('water-results').innerHTML = `<span class="eyebrow">ВОДНЫЙ ЭКВИВАЛЕНТ ПРОЕКТА</span><h3>Доступная вода после потерь</h3><div class="water-number">${number(r.min)}–${number(r.max)} <small>м³</small></div><p class="small">Пессимистично: потери ${inputs.lossMax}%. Оптимистично: ${inputs.lossMin}%.</p><div class="hectares">${number(r.hectaresMin, 2)}–${number(r.hectaresMax, 2)} га <span class="small">на сезон полива</span></div><div class="water-formula">${number(inputs.area)} м² × ${number(inputs.thickness, 2)} м = ${number(r.ice)} м³ льда<br>× ${D.model.iceDensity} (плотность относительно воды) = ${number(r.water)} м³ воды<br>× (1 − потери) ÷ ${number(inputs.demand)} м³/га → площадь полива</div>${r.hasSimulation ? `<p class="small"><b>Именно весной, март–май:</b> ${number(r.springMin)}–${number(r.springMax)} м³, или ${number(r.springMin / inputs.demand, 2)}–${number(r.springMax / inputs.demand, 2)} га. В расчёте учтены термический предел и доля весеннего таяния ${number(r.fraction * 100)}%. Накопление и доставка талой воды предполагаются доступными.</p>` : '<p class="small">Срок получения воды неизвестен: нет температурного профиля для сезонной модели.</p>'}`;
+  const formula = t('{area} м² × {thickness} м = {ice} м³ льда<br>× {density} (плотность относительно воды) = {water} м³ воды<br>× (1 − потери) ÷ {demand} м³/га → площадь полива', {
+    area: number(inputs.area), thickness: number(inputs.thickness, 2), ice: number(r.ice), density: number(D.model.iceDensity, 1), water: number(r.water), demand: number(inputs.demand)
+  });
+  const spring = r.hasSimulation ? t('<b>Именно весной, март–май:</b> {min}–{max} м³, или {haMin}–{haMax} га. В расчёте учтены термический предел и доля весеннего таяния {fraction}%. Накопление и доставка талой воды предполагаются доступными.', {
+    min: number(r.springMin), max: number(r.springMax), haMin: number(r.springMin / inputs.demand, 2), haMax: number(r.springMax / inputs.demand, 2), fraction: number(r.fraction * 100)
+  }) : t('Срок получения воды неизвестен: нет температурного профиля для сезонной модели.');
+  $('water-results').innerHTML = `<span class="eyebrow">${t('ВОДНЫЙ ЭКВИВАЛЕНТ ПРОЕКТА')}</span><h3>${t('Доступная вода после потерь')}</h3><div class="water-number">${number(r.min)}–${number(r.max)} <small>${t('м³')}</small></div><p class="small">${t('Пессимистично: потери {max}%. Оптимистично: {min}%.', { max: number(inputs.lossMax), min: number(inputs.lossMin) })}</p><div class="hectares">${number(r.hectaresMin, 2)}–${number(r.hectaresMax, 2)} ${t('га')} <span class="small">${t('на сезон полива')}</span></div><div class="water-formula">${formula}</div><p class="small">${spring}</p>`;
   const peakThickness = r.peak / inputs.area;
   $('thickness-check').className = 'small' + (r.hasSimulation && inputs.thickness > peakThickness ? ' error' : '');
-  $('thickness-check').textContent = r.hasSimulation ? `Термический предел: ${number(peakThickness, 2)} м; проект: ${number(inputs.thickness, 2)} м. ${inputs.thickness > peakThickness ? 'Проектная толщина превышает модельный предел. Для весеннего результата взят меньший объём.' : 'Проектная толщина укладывается в предел упрощённой модели.'}` : 'Для проверки проектной толщины нужен архив температур.';
+  $('thickness-check').textContent = r.hasSimulation ? t('Термический предел: {peak} м; проект: {design} м.', { peak: number(peakThickness, 2), design: number(inputs.thickness, 2) }) + ' ' + t(inputs.thickness > peakThickness ? 'Проектная толщина превышает модельный предел. Для весеннего результата взят меньший объём.' : 'Проектная толщина укладывается в предел упрощённой модели.') : t('Для проверки проектной толщины нужен архив температур.');
 }
 
 function loadPilotScenario() {
@@ -295,26 +381,29 @@ function updateAll() {
   const otherSite = D.sites.find(s => s.id === $('compare-site').value);
   state.otherSeries = state.comparing && offset !== null ? simulateIce(otherSite, waterInputs.area, offset) : [];
   setSimulationDay();
-  $('sim-inputs').textContent = `Площадь: ${waterInputs.area === null ? 'нет данных' : number(waterInputs.area) + ' м²'}. k = ${D.model.k} м/√(°C·день); таяние = ${D.model.meltFactor} м/(°C·день). Сдвиг профиля: ${offset === null ? 'нет данных' : number(offset, 2) + ' °C'}.`;
-  $('monthly-data').innerHTML = state.site.months ? Array.from({length:9}, (_,i) => (i + 10) % 12).map(m => `<span class="month-chip">${monthNames[m]} <b>${number(state.site.months[m],1)} °C</b></span>`).join('') : '<p>Архив температур не получен.</p>';
+  $('sim-inputs').textContent = t('Площадь: {area}. k = {k} м/√(°C·день); таяние = {melt} м/(°C·день). Сдвиг профиля: {offset}.', {
+    area: waterInputs.area === null ? t('нет данных') : number(waterInputs.area) + ' ' + t('м²'), k: number(D.model.k, 3), melt: number(D.model.meltFactor, 3), offset: offset === null ? t('нет данных') : number(offset, 2) + ' °C'
+  });
+  $('monthly-data').innerHTML = state.site.months ? Array.from({ length: 9 }, (_, i) => (i + 10) % 12).map(m => `<span class="month-chip">${monthName(m)} <b>${number(state.site.months[m], 1)} °C</b></span>`).join('') : `<p>${t('Архив температур не получен.')}</p>`;
   const result = calculateWaterRange(waterInputs, state.series);
   renderWaterResults(result, waterInputs);
   $('pilot-story').hidden = !state.pilot;
   if (state.pilot) {
-    $('pilot-story').innerHTML = `<strong>Пилотный участок · демонстрационный сценарий у Ат-Башы</strong><br>Реальный ориентир и реанализ Open-Meteo; площадка не обследована. Уклон ${siteInputs.slope}° и расстояние ${siteInputs.distance} м — учебные допущения.<br>${suitability.complete ? `Оценка ${suitability.score}/100.` : 'Оценка требует заполнения параметров.'} Зима: до ${number(result?.peak || 0)} м³ льда по модели. ${result ? `Проект: ${number(result.ice)} м³. Весна: ${number(result.springMin)}–${number(result.springMax)} м³ воды после потерь → ${number(result.springMin / waterInputs.demand, 2)}–${number(result.springMax / waterInputs.demand, 2)} га при норме ${number(waterInputs.demand)} м³/га.` : 'Проверьте входные данные.'}`;
+    const pilotResult = result ? t('Проект: {ice} м³. Весна: {min}–{max} м³ воды после потерь → {haMin}–{haMax} га при норме {demand} м³/га.', {
+      ice: number(result.ice), min: number(result.springMin), max: number(result.springMax), haMin: number(result.springMin / waterInputs.demand, 2), haMax: number(result.springMax / waterInputs.demand, 2), demand: number(waterInputs.demand)
+    }) : t('Проверьте входные данные.');
+    $('pilot-story').innerHTML = t('<strong>Пилотный участок · демонстрационный сценарий у Ат-Башы</strong><br>Реальный ориентир и реанализ Open-Meteo; площадка не обследована. Уклон {slope}° и расстояние {distance} м — учебные допущения.<br>{score} Зима: до {peak} м³ льда по модели. {result}', {
+      slope: siteInputs.slope === null ? t('нет данных') : number(siteInputs.slope, 1), distance: siteInputs.distance === null ? t('нет данных') : number(siteInputs.distance), score: suitability.complete ? t('Оценка {score}/100.', { score: suitability.score }) : t('Оценка требует заполнения параметров.'), peak: number(result?.peak || 0), result: pilotResult
+    });
   }
 }
 
 function init() {
-  $('site-buttons').innerHTML = D.sites.map(s => `<button class="site-button" data-site="${s.id}">${s.name} ↗</button>`).join('');
+  captureStaticText();
+  renderLanguage();
   $('site-buttons').addEventListener('click', e => { const button = e.target.closest('[data-site]'); if (button) selectSite(button.dataset.site); });
-  $('score-rules').innerHTML = D.rules.map(r => `<div><b>${r.name} / ${r.max} баллов</b><p>${r.explanation}</p></div>`).join('');
-  $('crop').innerHTML = D.crops.map(c => `<option value="${c.id}">${c.name}</option>`).join('');
+  document.querySelector('.language-switch').addEventListener('click', e => { const button = e.target.closest('[data-language]'); if (button) setLanguage(button.dataset.language); });
   $('demand').value = D.crops[0].demand;
-  $('compare-site').innerHTML = D.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
-  $('compare-site').value = 'naryn';
-  $('season-label').textContent = D.season.label + ' · сглаженный профиль';
-  $('model-description').textContent = `Рост: h = k × √FDD, k = ${D.model.k} м/√(°C·день). FDD — накопленные отрицательные градусо-дни ноября–февраля. Приращение толщины добавляется к остатку льда. Таяние: Δh = ${D.model.meltFactor} × max(T, 0) м/день, не больше имеющегося льда. Объём = площадь × h. Плотность льда относительно воды = ${D.model.iceDensity}. Все коэффициенты — допущения из data.js, требуют калибровки.`;
   $('refresh').addEventListener('click', fetchSiteData);
   $('pilot').addEventListener('click', loadPilotScenario);
   $('compare-toggle').addEventListener('click', compareSites);
@@ -324,5 +413,6 @@ function init() {
   ['elevation','temperature','slope','distance','area','thickness','demand','loss-min','loss-max'].forEach(id => $(id).addEventListener('input', updateAll));
   initMap();
   selectSite('naryn');
+  renderLanguage();
 }
 init();
